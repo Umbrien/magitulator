@@ -88,19 +88,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         last_new_oid = Some(new_oid);
     }
 
+    let refname = dst_repo
+        .head_ref()?
+        .expect("b")
+        .name()
+        .as_bstr()
+        .to_string();
+
     if let Some(final_oid) = last_new_oid {
-        let head_ref_name = "refs/heads/main";
         dst_repo.edit_reference(RefEdit {
             change: Change::Update {
                 log: LogChange::default(),
                 expected: gix::refs::transaction::PreviousValue::Any,
                 new: gix::refs::Target::Object(final_oid),
             },
-            name: head_ref_name.try_into()?,
+            name: refname.clone().try_into()?,
             deref: false,
         })?;
-        println!("✅ Set {} to point to {}", head_ref_name, final_oid);
+        println!("✅ Set {} to point to {}", refname, final_oid);
     }
+
+    // Run checkout
+    let git2_dst_repo = git2::Repository::open(dst_repo_path)?;
+    git2_dst_repo.set_head(&refname)?;
+    git2_dst_repo.checkout_head(None)?;
 
     println!("✅ New repo created at {}", dst_repo_path);
     Ok(())
