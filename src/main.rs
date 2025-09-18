@@ -1,118 +1,111 @@
 use gix::{
     ObjectId,
     bstr::BString,
-    diff::object::commit::MessageRef,
     objs::Commit,
     refs::transaction::{Change, LogChange, RefEdit},
 };
-use std::collections::HashMap;
-use std::path::Path;
-
-mod copy_object_recursive;
-use crate::copy_object_recursive::copy_object_recursive;
+use std::{collections::HashMap, env};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let src_repo_path = "repo-a";
-    let dst_repo_path = "repo-b";
+    // --- 1. Setup: Read args and open the repository ---
+    let args: Vec<String> = env::args().collect();
+    if args.len() < 2 {
+        eprintln!("Usage: {} <branch-name>", args[0]);
+        std::process::exit(1);
+    }
+    let branch_name = &args[1];
+    let repo = gix::open(".")?;
 
-    let src_repo = gix::open(src_repo_path)?;
+    // --- 2. Topological traversal ---
+    let head_id = repo.head_id()?;
 
-    let dst_repo = if Path::new(dst_repo_path).exists() {
-        gix::open(dst_repo_path)?
-    } else {
-        gix::init(dst_repo_path)?
-    };
+    let topo = gix::traverse::commit::topo::Builder::from_iters(
+        &repo.objects,
+        // [head_commit_id],
+        [head_id],
+        None::<Vec<gix::ObjectId>>,
+    )
+    .build()?;
 
-    let head_id = src_repo.head()?.id().expect("Unborn head");
-
-    let revwalk = src_repo.rev_walk([head_id]).all()?;
-
-    let mut ids_to_process: Vec<ObjectId> = revwalk
-        .map(|res| res.map(|info| info.id))
-        .collect::<Result<_, _>>()?;
-
+    let mut ids_to_process: Vec<ObjectId> = Vec::new();
+    for info in topo {
+        let info = info?;
+        ids_to_process.push(info.id);
+    }
     ids_to_process.reverse();
 
+    // --- 3. Rewrite commits one by one ---
     let mut parent_map: HashMap<ObjectId, ObjectId> = HashMap::new();
     let mut last_new_oid: Option<ObjectId> = None;
 
-    for id in ids_to_process {
-        println!("Processing commit: {id}");
+    for old_id in ids_to_process {
+        let old_commit = repo.find_object(old_id)?.try_into_commit()?;
+        let old_commit_ref = old_commit.decode()?;
 
-        let commit = src_repo.find_commit(id)?;
+        // Since we're in the same repo, we don't need to copy the tree.
+        // We just point our new commit to the *exact same tree*.
+        let tree_id = old_commit.tree_id()?;
 
-        let commit_ref = commit.decode()?;
-
-        let message_ref = commit.message().unwrap_or(MessageRef {
-            title: "no message".into(),
-            body: None,
-        });
-
-        let message = match message_ref.body {
-            Some(body) => format!("{}\n\n{}", message_ref.title, body),
-            None => message_ref.title.to_string(),
-        };
-
-        let src_tree_id = commit.tree_id()?;
-        let new_tree_id = copy_object_recursive(&src_repo, &dst_repo, &src_tree_id)?;
-
-        let author = commit.author()?;
-        let committer = commit.committer()?;
-
-        let new_parent_ids: Vec<ObjectId> = commit
+        // Map old parent IDs to their new, rewritten counterparts.
+        let new_parent_ids: Vec<ObjectId> = old_commit
             .parent_ids()
             .map(|parent_id| {
                 *parent_map
                     .get(&parent_id.detach())
-                    .expect("Parent must have been processed")
+                    .expect("Parent must have been processed and mapped already")
             })
             .collect();
 
+        // --- !! This is where you'd implement your modification logic !! ---
+        let mut author = old_commit.author()?;
+        author.name = "Dr. Magitulator".into();
+
+        let committer = old_commit.committer()?;
+        // Example: Add one day to the commit time
+        // committer.time.seconds += 86400;
+
+        // Create a new commit object with the modified data.
         let new_commit = Commit {
-            tree: new_tree_id,
+            tree: tree_id.detach(),
             parents: new_parent_ids.into(),
             author: author.into(),
             committer: committer.into(),
-            encoding: commit_ref.encoding.map(|s| s.into()),
-            message: message.into(),
-            extra_headers: commit_ref
+            encoding: old_commit_ref.encoding.map(|s| s.into()),
+            message: old_commit_ref.message.into(),
+            extra_headers: old_commit_ref
                 .extra_headers
                 .into_iter()
                 .map(|(k, v)| (k.into(), BString::from(v.as_ref())))
                 .collect(),
         };
 
-        let new_oid = dst_repo.write_object(&new_commit)?.into();
+        let new_oid = repo.write_object(&new_commit)?.into();
 
-        parent_map.insert(id, new_oid);
+        parent_map.insert(old_id, new_oid);
         last_new_oid = Some(new_oid);
     }
 
-    let refname = dst_repo
-        .head_ref()?
-        .expect("b")
-        .name()
-        .as_bstr()
-        .to_string();
+    // --- 4. Create the new branch pointing to the final rewritten commit ---
+    let new_branch_name = format!("{}-magitied", branch_name);
+    let full_ref_name = format!("refs/heads/{}", new_branch_name);
 
     if let Some(final_oid) = last_new_oid {
-        dst_repo.edit_reference(RefEdit {
+        repo.edit_reference(RefEdit {
             change: Change::Update {
                 log: LogChange::default(),
                 expected: gix::refs::transaction::PreviousValue::Any,
                 new: gix::refs::Target::Object(final_oid),
             },
-            name: refname.clone().try_into()?,
+            name: full_ref_name.clone().try_into().map_err(|e| {
+                format!(
+                    "Failed to create valid reference name '{}': {}",
+                    full_ref_name, e
+                )
+            })?,
             deref: false,
-        })?;
-        println!("✅ Set {} to point to {}", refname, final_oid);
+        })
+        .map_err(|e| format!("Failed to edit reference '{}': {}", full_ref_name, e))?;
     }
 
-    // Run checkout
-    let git2_dst_repo = git2::Repository::open(dst_repo_path)?;
-    git2_dst_repo.set_head(&refname)?;
-    git2_dst_repo.checkout_head(None)?;
-
-    println!("✅ New repo created at {}", dst_repo_path);
     Ok(())
 }
