@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use magitulator::{AnyResult, mirror::mirror};
+use magitulator::{AnyResult, mirror};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -46,7 +46,7 @@ fn main() -> AnyResult<()> {
 
     match &cli.command {
         Commands::Mirror { base, target } => {
-            mirror(&base, &target)?;
+            mirror::mirror(&base, &target, cli.dry_run)?;
         }
         Commands::Apply { target } => {
             // Logic to delete original and rename mirrored branch

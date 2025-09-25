@@ -9,5 +9,6 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4.5.47", features = ["derive"] }
+colored = "3.0.0"
 gix = "0.73.0"
 thiserror = "2.0.16"
